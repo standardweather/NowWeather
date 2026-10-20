@@ -33,7 +33,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      # If lightning can't be collected, publish the page anyway; it says lightning is unavailable.
       - run: python collect_glm.py
+        continue-on-error: true
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

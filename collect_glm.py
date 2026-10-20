@@ -51,9 +51,8 @@ def recent_keys(bucket):
     return keys
 
 
-def flashes(bucket, key):
+def flashes(data):
     """(lat, lon, time) arrays for one GLM file, already limited to the box."""
-    data = get(f"https://{bucket}.s3.amazonaws.com/{key}")
     with tempfile.NamedTemporaryFile(suffix=".nc") as f:
         f.write(data)
         f.flush()
@@ -78,11 +77,21 @@ def main():
             jobs += [(bucket, k) for _, k in recent_keys(bucket)]
         except Exception as e:
             errors.append(f"{name} listing: {e}")
-    results = []
+    # Downloads run in parallel; reading stays on one thread because HDF5 (under netCDF4) isn't
+    # thread-safe and crashes the process when files are opened concurrently.
     with ThreadPoolExecutor(12) as ex:
-        for r in ex.map(lambda j: _safe(flashes, *j, errors=errors), jobs):
-            if r is not None:
-                results.append(r)
+        blobs = list(ex.map(lambda j: _safe(get, f"https://{j[0]}.s3.amazonaws.com/{j[1]}", errors=errors), jobs))
+    results = []
+    for (_, key), data in zip(jobs, blobs):
+        if data is None:
+            continue
+        try:
+            r = flashes(data)
+        except Exception as e:
+            errors.append(f"{key}: {e}")
+            continue
+        if r is not None:
+            results.append(r)
 
     cells = {}
     total = 0

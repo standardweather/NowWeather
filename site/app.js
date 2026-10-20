@@ -396,7 +396,7 @@
   const AGE_COLOR = (m) => (m < 5 ? "#ffffff" : m < 10 ? "#ffe27a" : "#ff9548");
   async function loadLightning() {
     const res = await fetch(`data/glm.json?t=${Date.now()}`, { cache: "no-store" });
-    if (!res.ok) return;
+    if (!res.ok) { state.glm = { missing: true }; drawLegend(); return; }
     const d = await res.json();
     const lag = (Date.now() - Date.parse(d.generated)) / 60000;
     state.glm = { ...d, lag };
@@ -408,6 +408,8 @@
     }
     drawLegend();
   }
+
+  const ago = (min) => (min < 90 ? `${Math.round(min)} min` : `${Math.floor(min / 60)} h ${Math.floor(min % 60)} min`);
 
   // —— Map legend ———————————————————————————————————————————————————
   const Legend = L.Control.extend({ options: { position: "bottomright" }, onAdd() { const d = L.DomUtil.create("div", "maplegend"); d.id = "legend"; return d; } });
@@ -422,7 +424,11 @@
     };
     sw(state.swath.hail, "hail");
     sw(state.swath.rot, "rot");
-    if (state.on.lightning && state.glm) {
+    if (state.on.lightning && state.glm && (state.glm.missing || state.glm.lag > state.glm.windowMinutes + 10)) {
+      // Every flash is older than the page draws, so say why the map shows none.
+      const g = state.glm;
+      parts.push(`<h5 class="sub">Lightning (GOES GLM) · ${g.missing ? "unavailable" : `no recent data · last update ${ago(g.lag)} ago`}</h5>`);
+    } else if (state.on.lightning && state.glm) {
       const g = state.glm;
       parts.push(`<h5 class="sub">Lightning (GOES GLM) · ${g.flashes} flashes${g.lag > 20 ? ` · ${Math.round(g.lag)} min old` : ""}</h5><div class="key"><span><i style="background:#fff;border-radius:50%"></i>&lt; 5 min</span><span><i style="background:#ffe27a;border-radius:50%"></i>5–10</span><span><i style="background:#ff9548;border-radius:50%"></i>10–15+</span></div>`);
     }

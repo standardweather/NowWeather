@@ -2,7 +2,9 @@ name: Deploy to GitHub Pages
 
 # Most of the page reads its data live in the browser. Lightning (NOAA GOES GLM) arrives as netCDF,
 # which browsers can't read, so collect_glm.py summarizes it into data/glm.json on every run.
-# GitHub may start scheduled runs several minutes late; the page shows the lightning's age.
+# GitHub often delays or drops 5-minute schedules for hours, so each run on main also starts the
+# next one about 5 minutes after it began (job "next"). The schedule stays as a backup that
+# restarts the chain if it ever stops. The page shows the lightning's age.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -12,16 +14,19 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Only the deploy holds the Pages lock, so a waiting "next" job never blocks a deploy.
+    # A newer pending run replaces an older pending one, which ends that run's chain.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     timeout-minutes: 10
     environment:
       name: github-pages
@@ -42,3 +47,26 @@ jobs:
           path: site
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  next:
+    needs: deploy
+    # Keep the chain going after a failed deploy, but not after a cancelled one or off main.
+    if: ${{ !cancelled() && needs.deploy.result != 'cancelled' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Start the next run about 5 minutes after this one began
+        run: |
+          started=$(date -d "$(gh api "repos/$GH_REPO/actions/runs/${{ github.run_id }}" --jq .run_started_at)" +%s)
+          wait=$(( started + 300 - $(date +%s) ))
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          # Another run already queued or running (a push, the schedule, another chain) carries on instead.
+          others=$(gh run list --workflow pages.yml --json databaseId,status \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }} and (.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\" or .status == \"pending\"))] | length")
+          if [ "$others" -gt 0 ]; then echo "Another run is active; not starting one."; exit 0; fi
+          gh workflow run pages.yml --ref main

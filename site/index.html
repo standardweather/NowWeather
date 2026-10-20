@@ -23,6 +23,22 @@
   <!-- Shared theme and console layout from the main site (standardweather.github.io repo). -->
   <link rel="stylesheet" href="/css/site.css" />
   <link rel="stylesheet" href="/css/console.css?v=1" />
+  <style>
+    /* NowWeather-only pieces. */
+    .stat { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; padding: 0.4rem 0; border-top: 1px solid var(--rule); font-size: 0.84rem; }
+    .stat b { font: 500 1rem var(--mono); color: #fff; white-space: nowrap; }
+    .stat small { display: block; color: var(--text3); font-size: 0.72rem; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem; margin-top: 0.7rem; }
+    .actions .btn { min-height: 2.1rem; padding: 0 0.9rem; font-size: 0.82rem; border-radius: 6px; box-shadow: none; }
+    .linkish { all: unset; cursor: pointer; color: var(--accent); font-size: 0.8rem; }
+    .linkish:hover { text-decoration: underline; }
+    label.notify { display: flex; gap: 0.5rem; align-items: center; margin: 0.7rem 0 0; font-size: 0.8rem; font-weight: 400; color: var(--text2); letter-spacing: 0; text-transform: none; }
+    label.notify input { appearance: auto; width: 0.9rem; height: 0.9rem; min-height: 0; margin: 0; accent-color: var(--accent); box-shadow: none; }
+    pre.afd { white-space: pre-wrap; font: 0.72rem/1.5 var(--mono); color: var(--text2); margin: 0.4rem 0 0; }
+    .obs { text-align: center; line-height: 1; pointer-events: auto; }
+    .obs b { font: 600 0.8rem var(--mono); text-shadow: 0 0 3px #060818, 0 0 3px #060818; }
+    .obs small { display: block; font: 0.62rem var(--mono); color: #ffbf47; text-shadow: 0 0 3px #060818; }
+  </style>
 </head>
 <body class="console">
   <nav class="site-nav" aria-label="Primary">
@@ -49,8 +65,9 @@
       <div class="tabs" role="tablist" aria-label="View" id="views">
         <button role="tab" data-view="alerts" aria-selected="true">Alerts</button>
         <button role="tab" data-view="outlook" aria-selected="false">SPC outlook</button>
-        <button role="tab" data-view="reports" aria-selected="false">Storm reports</button>
+        <button role="tab" data-view="reports" aria-selected="false">Reports</button>
         <button role="tab" data-view="forecast" aria-selected="false">Forecast</button>
+        <button role="tab" data-view="place" aria-selected="false">My place</button>
       </div>
       <div class="scroll" id="panel"><p class="empty">Loading…</p></div>
       <div class="side__foot">
@@ -62,6 +79,7 @@
           <label><input type="checkbox" data-layer="mds" checked /> Mesoscale discussions</label>
           <label><input type="checkbox" data-layer="reports" checked /> Storm reports</label>
           <label><input type="checkbox" data-layer="lightning" checked /> Lightning (15 min)</label>
+          <label><input type="checkbox" data-layer="obs" /> Surface obs</label>
         </div>
         <div class="satpick" id="hailpick" role="group" aria-label="Hail size"><span>Hail size</span><button data-v="off" aria-pressed="true">Off</button><button data-v="hail60" aria-pressed="false">Last hour</button><button data-v="hail" aria-pressed="false">24 h</button></div>
         <div class="satpick" id="rotpick" role="group" aria-label="Rotation"><span>Rotation</span><button data-v="off" aria-pressed="true">Off</button><button data-v="rotation60" aria-pressed="false">Last hour</button><button data-v="rotation" aria-pressed="false">24 h</button></div>
@@ -87,6 +105,6 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="/js/mrms.js?v=1"></script>
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

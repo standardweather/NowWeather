@@ -6,7 +6,8 @@
  *   SPC (spc.noaa.gov)               convective outlooks (GeoJSON + text), today's/yesterday's storm reports
  *   NOAA map services                SPC mesoscale discussions
  *   NOAA MRMS (noaa-mrms-pds)        hail-size and rotation swaths, decoded in the browser by /js/mrms.js
- *   NWS API points/forecast          forecast for any clicked spot
+ *   NWS API points/forecast          forecast and area forecast discussion for any clicked spot; alerts at "My place"
+ *   NOAA map services (AWC METARs)   surface observations layer
  * Collected every ~5 minutes by GitHub Actions into data/glm.json (collect_glm.py):
  *   NOAA GOES Geostationary Lightning Mapper flashes
  */
@@ -16,6 +17,7 @@
   const NWS = "https://api.weather.gov";
   const NOWCOAST = "https://nowcoast.noaa.gov/geoserver";
   const SPC = "https://www.spc.noaa.gov";
+  const AWC_METAR = "https://mapservices.weather.noaa.gov/vector/rest/services/aviation/awc_aviation_weather/MapServer/42";
   const MD_LAYER = "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/spc_mesoscale_discussion/MapServer/0";
   const CONUS = [[24, -125], [50, -66]];
   const RADAR_FRAMES = 12;           // about 2 hours at ~10-minute spacing
@@ -85,9 +87,10 @@
     alerts: [], alertsTime: null,
     outlookDay: "1", outlookType: "cat", outlookGeo: null, outlookText: "",
     mds: null, reportsDay: "today", reports: null,
-    on: { radar: true, alerts: true, outlook: false, mds: true, reports: true, lightning: true },
+    on: { radar: true, alerts: true, outlook: false, mds: true, reports: true, lightning: true, obs: false },
     swath: { hail: "off", rot: "off" },
-    point: null, glm: null,
+    point: null, glm: null, afd: null, obs: null,
+    place: null,      // "My place": { label, lat, lon, alerts, radar, notify, seen }
     radar: { times: [], layers: [], idx: 0, timer: null, opacity: 0.75 },
   };
 
@@ -113,6 +116,8 @@
     mds: L.layerGroup(),
     reports: L.layerGroup(),
     highlight: L.layerGroup().addTo(map),
+    obs: L.layerGroup(),
+    place: L.layerGroup().addTo(map),
   };
   Object.entries(state.on).forEach(([k, v]) => { if (v && layers[k]) layers[k].addTo(map); });
 
@@ -278,10 +283,11 @@
   map.on("click", async (e) => {
     const popup = L.popup({ maxWidth: 340 }).setLatLng(e.latlng).setContent(`<p>Loading…</p>`).openOn(map);
     const [alertsHtml, fc] = await Promise.all([identifyAlerts(e.latlng).catch(() => ""), loadPointForecast(e.latlng).catch(() => null)]);
-    const fcHtml = fc && fc.periods.length
+    const fcHtml = (fc && fc.periods.length
       ? `<h4>Forecast · ${esc(fc.place)}</h4>${fc.periods.slice(0, 2).map((p) => `<p><b>${esc(p.name)}</b> ${p.temperature}°${esc(p.temperatureUnit)} · ${esc(p.shortForecast)} · wind ${esc(p.windSpeed)}</p>`).join("")}
         <p><a href="#" data-forecast="1">7-day and hourly forecast</a></p>`
-      : `<p>No NWS forecast for this spot (outside the US forecast area).</p>`;
+      : `<p>No NWS forecast for this spot (outside the US forecast area).</p>`) +
+      `<p><a href="#" data-watch="${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}" data-label="${esc(fc?.place || "")}">Watch this spot</a> · <a href="/PastWeather/?loc=${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}&amp;view=history">Hail history</a></p>`;
     popup.setContent([alertsHtml, fcHtml].filter(Boolean).join("<hr>"));
     if (state.view === "forecast") render();
   });
@@ -355,7 +361,123 @@
       <table class="t" style="margin-top:.6rem"><tbody>${f.periods.map((p, i) => `<tr data-period="${i}"><td style="width:6.5rem"><b style="color:#fff">${esc(p.name)}</b><small>${p.probabilityOfPrecipitation?.value ? `${p.probabilityOfPrecipitation.value}% precip` : ""}</small></td>
         <td style="width:3rem;color:${p.isDaytime ? "#ffbf47" : "#7cb8ff"}">${p.temperature}°</td><td>${esc(p.shortForecast)}<small>${esc(p.windDirection)} ${esc(p.windSpeed)}</small>
         ${state.openPeriod === i ? `<small style="color:var(--text2);margin-top:.3rem">${esc(p.detailedForecast)}</small>` : ""}</td></tr>`).join("")}</tbody></table>
-      <p class="note"><a href="${esc(f.link)}" target="_blank" rel="noopener">Full forecast at weather.gov ↗</a></p></div>`;
+      <p class="note"><a href="${esc(f.link)}" target="_blank" rel="noopener">Full forecast at weather.gov ↗</a></p>
+      ${afdHtml(f.office)}</div>`;
+  }
+
+  // —— Area forecast discussion (NWS API products) ———————————————————————————
+  function afdHtml(office) {
+    const a = state.afd;
+    if (!office) return "";
+    if (!a || a.office !== office || a.status === "closed") return `<p class="note"><button class="linkish" data-afd="${esc(office)}">Read the forecast discussion from NWS ${esc(office)}</button></p>`;
+    if (a.status === "loading") return `<p class="note">Loading the forecast discussion…</p>`;
+    if (a.status === "error") return `<p class="note">The forecast discussion couldn't be loaded.</p>`;
+    return `<h5 class="sub" style="margin-top:.9rem">Area forecast discussion · NWS ${esc(office)} · ${esc(dayZ(a.issued))} <button class="linkish" data-afd-close="1">hide</button></h5>
+      <pre class="afd">${esc(a.text)}</pre>`;
+  }
+  async function loadAfd(office) {
+    state.afd = { office, status: "loading" };
+    render();
+    try {
+      const list = await (await fetch(`${NWS}/products/types/AFD/locations/${office}`)).json();
+      const latest = list["@graph"]?.[0];
+      if (!latest) throw new Error("none");
+      const prod = await (await fetch(latest["@id"])).json();
+      // Drop the WMO header lines and keep the discussion itself.
+      const text = (prod.productText || "").replace(/^[\s\S]*?(\.(?:KEY MESSAGES|SYNOPSIS|UPDATE|DISCUSSION|NEAR TERM|SHORT TERM)[^\n]*\n)/, "$1").replace(/\n{3,}/g, "\n\n").trim()
+        // Unwrap the fixed-width lines so the text reflows in the sidebar; keep bullets, section heads and && breaks.
+        .replace(/([^\n])\n(?!\n|\s*-\s|\.|&&)\s*/g, "$1 ").replace(/ {2,}/g, " ");
+      state.afd = { office, status: "ready", issued: prod.issuanceTime, text };
+    } catch {
+      state.afd = { office, status: "error" };
+    }
+    if (state.view === "forecast") render();
+  }
+
+  // —— My place: alerts, lightning, radar and reports at one spot, with optional browser notifications ——————
+  const PLACE_KEY = "sw-place";
+  function savedPlace() { try { return JSON.parse(localStorage.getItem(PLACE_KEY) || "null"); } catch { return null; } }
+  function setPlace(p, save = true) {
+    state.place = { label: p.label || `${p.lat.toFixed(3)}, ${p.lon.toFixed(3)}`, lat: p.lat, lon: p.lon, alerts: null, radar: null, notify: state.place?.notify || false, seen: new Set() };
+    if (save) { try { localStorage.setItem(PLACE_KEY, JSON.stringify({ label: state.place.label, lat: p.lat, lon: p.lon })); } catch { /* private mode */ } }
+    drawPlace();
+    refreshPlace(true);
+  }
+  function drawPlace() {
+    layers.place.clearLayers();
+    const p = state.place;
+    if (!p) return;
+    L.circleMarker([p.lat, p.lon], { pane: "points", radius: 7, color: "#fff", weight: 2.5, fillColor: "#4ad1ff", fillOpacity: 1 })
+      .bindTooltip(`My place · ${esc(p.label)}`, { className: "tw-tip", direction: "top", offset: [0, -8] }).addTo(layers.place);
+    [16.09, 48.28].forEach((km) => L.circle([p.lat, p.lon], { pane: "points", radius: km * 1000, color: "#4ad1ff", weight: 1, opacity: 0.5, fill: false, dashArray: "4 4", interactive: false }).addTo(layers.place));
+  }
+  const kmBetween = (lat1, lon1, lat2, lon2) => {
+    const r = Math.PI / 180, a = Math.sin(((lat2 - lat1) * r) / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(((lon2 - lon1) * r) / 2) ** 2;
+    return 12742 * Math.asin(Math.sqrt(a));
+  };
+  const mi = (km) => (km * 0.621371 < 10 ? (km * 0.621371).toFixed(1) : Math.round(km * 0.621371));
+  async function refreshPlace(first) {
+    const p = state.place;
+    if (!p) return;
+    const [alerts, radar] = await Promise.all([
+      fetch(`${NWS}/alerts/active?point=${p.lat.toFixed(4)},${p.lon.toFixed(4)}`, { headers: { Accept: "application/geo+json" } }).then((r) => r.json()).then((d) => d.features.map((f) => f.properties)).catch(() => null),
+      p.lat > 20 && p.lat < 55 && p.lon > -130 && p.lon < -60 ? MRMS.fetchProduct("reflectivity", new Date().toISOString(), p.lat, p.lon, { halfLat: 0.3, maxMinutes: 15 }).catch(() => null) : null,
+    ]);
+    if (state.place !== p) return;
+    p.alerts = alerts;
+    p.radar = radar;
+    p.checked = new Date().toISOString();
+    if (state.view === "place") render();
+    notifyPlace(first);
+  }
+  /** Flashes, by age, within 10 and 30 miles of the place, and the nearest one. */
+  function placeLightning(p) {
+    const g = state.glm;
+    if (!g || g.missing || !g.cells) return null;
+    let near = null, n10 = 0, n30 = 0;
+    for (const [lat, lon, n, age] of g.cells) {
+      if (age + g.lag > g.windowMinutes + 10) continue;
+      const km = kmBetween(p.lat, p.lon, lat, lon);
+      if (km <= 16.09) n10 += n;
+      if (km <= 48.28) n30 += n;
+      if (!near || km < near.km) near = { km, age: age + g.lag };
+    }
+    return { near, n10, n30 };
+  }
+  function notifyPlace(first) {
+    const p = state.place;
+    if (!p?.notify || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const fresh = (p.alerts || []).filter((a) => !p.seen.has(a.id));
+    fresh.forEach((a) => p.seen.add(a.id));
+    const lt = placeLightning(p);
+    const msgs = first ? [] : fresh.map((a) => `${a.event} until ${dayZ(a.expires)}`);
+    if (!first && lt?.n10 && !p.lightningWarned) { msgs.push(`Lightning within 10 miles (${lt.n10} flashes in 15 min)`); p.lightningWarned = true; }
+    if (lt && !lt.n10) p.lightningWarned = false;
+    msgs.forEach((m) => { try { new Notification(`NowWeather · ${p.label}`, { body: m, icon: "/assets/icon-192.png" }); } catch { /* not allowed here */ } });
+  }
+
+  function placeView() {
+    const p = state.place;
+    const saved = savedPlace();
+    const intro = `<div class="pad"><p class="note" style="margin-top:0">Pick a spot to watch: your location, a spot you click on the map (then “Watch this spot”), or the last place you used on Standard Weather.</p>
+      <div class="actions"><button class="btn" data-locate="1">Use my location</button>${saved && (!p || saved.lat !== p.lat || saved.lon !== p.lon) ? `<button class="linkish" data-saved="1">Use ${esc(saved.label)}</button>` : ""}</div></div>`;
+    if (!p) return intro;
+    const stat = (label, value, small) => `<div class="stat"><span>${label}${small ? `<small>${small}</small>` : ""}</span><b>${value}</b></div>`;
+    const lt = placeLightning(p);
+    const reports = (state.reports || []).map((r) => ({ ...r, km: kmBetween(p.lat, p.lon, r.lat, r.lon) })).filter((r) => r.km <= 40.2).sort((a, b) => a.km - b.km);
+    let html = `<div class="pad"><h5 class="sub">My place · ${esc(p.label)}${p.checked ? ` · checked ${hhmmZ(p.checked)}` : ""}</h5>`;
+    if (p.alerts == null) html += `<p class="note">Checking alerts…</p>`;
+    else if (!p.alerts.length) html += stat("Alerts", "None", "No NWS watches, warnings or advisories in effect here");
+    else html += p.alerts.sort((a, b) => rank(a.event) - rank(b.event)).map((a) => `<div class="stat"><span><i class="dot" style="background:${colorOf(a.event)}"></i>${esc(a.event)}<small>${esc(a.senderName?.replace("NWS ", "") || "")} · until ${esc(dayZ(a.ends || a.expires))}</small></span>${state.alerts.some((x) => x.id === a.id) ? `<button class="linkish" data-goalert="${esc(a.id)}">details</button>` : ""}</div>`).join("");
+    html += lt ? stat("Lightning, 15 min", lt.near ? `${mi(lt.near.km)} mi` : "None", lt.near ? `Nearest flash, ${Math.round(lt.near.age)} min ago · ${lt.n10} within 10 mi · ${lt.n30} within 30 mi` : "No flashes within the GOES lightning window") : stat("Lightning", "—", "Lightning data unavailable");
+    if (p.radar) html += stat("Radar now", p.radar.at > 0 ? `${Math.round(p.radar.at)} dBZ` : "No echo", `${p.radar.peak > 0 ? `Strongest within 6 mi: ${Math.round(p.radar.peak)} dBZ` : "Nothing within 6 mi"} · MRMS ${hhmmZ(p.radar.timeIso)}`);
+    html += stat("Storm reports today", reports.length, reports[0] ? `Nearest: ${reportLabel(reports[0])}, ${mi(reports[0].km)} mi, ${esc(reports[0].time)}Z` : "None within 25 mi since 1200Z");
+    const canNotify = typeof Notification !== "undefined";
+    html += `<label class="notify"><input type="checkbox" data-notify="1"${p.notify ? " checked" : ""}${canNotify ? "" : " disabled"} /> Notify me of new alerts and lightning within 10 mi while this page is open</label>
+      <div class="actions"><button class="linkish" data-locate="1">Use my location</button><button class="linkish" data-forecast-here="1">Forecast here</button>
+        <a class="linkish" href="/PastWeather/?loc=${p.lat.toFixed(4)},${p.lon.toFixed(4)}&amp;view=history">Hail history</a><button class="linkish" data-clear="1">Stop watching</button></div>
+      <p class="note">Rings at 10 and 30 miles. Checked every 2 minutes.</p></div>`;
+    return html;
   }
 
   // —— Hail and rotation swaths (NOAA MRMS, decoded for the current view) ———————————
@@ -409,6 +531,45 @@
     drawLegend();
   }
 
+  // —— Surface observations (AWC METAR layer: temperature, wind and gusts) ———————————————
+  const tempColor = (f) => (f == null ? "#9aa3c0" : f < 10 ? "#b38bff" : f < 32 ? "#7cb8ff" : f < 50 ? "#6fe3e8" : f < 65 ? "#9be15d" : f < 80 ? "#ffe27a" : f < 95 ? "#ff9548" : "#ff5a5a");
+  async function loadObs() {
+    setStatus("Loading surface observations…");
+    const fetchPage = (offset) => fetch(`${AWC_METAR}/query?${new URLSearchParams({ where: "1=1", geometry: "-170,15,-50,72", geometryType: "esriGeometryEnvelope", inSR: 4326, outFields: "station_id,observation_time,temp_c,dewpoint_c,winddir,wind_speed_kt,wind_gust_kt,wx_string", f: "geojson", resultOffset: offset, resultRecordCount: 2000 })}`).then((r) => r.json());
+    const pages = await Promise.all([0, 2000, 4000].map(fetchPage));
+    const idx = {};
+    for (const f of pages.flatMap((p) => p.features || [])) {
+      const p = f.properties, c = f.geometry?.type === "MultiPoint" ? f.geometry.coordinates[0] : f.geometry?.coordinates;
+      if (!p.station_id || !c) continue;
+      if (!idx[p.station_id] || p.observation_time > idx[p.station_id].observation_time) idx[p.station_id] = { ...p, lat: c[1], lon: c[0] };
+    }
+    state.obs = Object.values(idx);
+    state.obsTime = Date.now();
+    setStatus("");
+    drawObs();
+  }
+  const kt2mph = (kt) => Math.round(kt * 1.15078);
+  function drawObs() {
+    layers.obs.clearLayers();
+    if (!state.on.obs || !state.obs) return;
+    const z = map.getZoom(), b = map.getBounds().pad(0.1);
+    for (const o of state.obs) {
+      if (!b.contains([o.lat, o.lon])) continue;
+      const tf = o.temp_c == null ? null : Math.round(o.temp_c * 9 / 5 + 32);
+      const wind = o.wind_speed_kt == null ? "" : o.wind_speed_kt === 0 ? "calm" : `${o.winddir != null && o.winddir !== "VRB" ? `${o.winddir}° ` : ""}${kt2mph(o.wind_speed_kt)}${o.wind_gust_kt ? `G${kt2mph(o.wind_gust_kt)}` : ""} mph`;
+      const tip = `${esc(o.station_id)} · ${tf != null ? `${tf}°F` : "—"}${o.dewpoint_c != null ? ` / dew ${Math.round(o.dewpoint_c * 9 / 5 + 32)}°` : ""} · ${esc(wind)}${o.wx_string ? ` · ${esc(o.wx_string)}` : ""} · ${hhmmZ(o.observation_time)}`;
+      if (z >= 7) {
+        L.marker([o.lat, o.lon], { pane: "points", icon: L.divIcon({ className: "obs", iconSize: [40, 26], iconAnchor: [20, 13],
+          html: `<b style="color:${tempColor(tf)}">${tf ?? "—"}</b>${o.wind_gust_kt ? `<small>G${kt2mph(o.wind_gust_kt)}</small>` : ""}` }) })
+          .bindTooltip(tip, { className: "tw-tip", direction: "top" }).addTo(layers.obs);
+      } else {
+        L.circleMarker([o.lat, o.lon], { renderer: lightningCanvas, radius: z <= 4 ? 2 : 3, weight: 0, fillColor: tempColor(tf), fillOpacity: 0.85 })
+          .bindTooltip(tip, { className: "tw-tip" }).addTo(layers.obs);
+      }
+    }
+  }
+  map.on("moveend", () => { if (state.on.obs) { drawObs(); drawLegend(); } });
+
   const ago = (min) => (min < 90 ? `${Math.round(min)} min` : `${Math.floor(min / 60)} h ${Math.floor(min % 60)} min`);
 
   // —— Map legend ———————————————————————————————————————————————————
@@ -424,6 +585,7 @@
     };
     sw(state.swath.hail, "hail");
     sw(state.swath.rot, "rot");
+    if (state.on.obs) parts.push(`<h5 class="sub">Surface temperature (°F)${map.getZoom() >= 7 ? " · G = gust, mph" : " · zoom in for values"}</h5><div class="key">${[["<10", "#b38bff"], ["10", "#7cb8ff"], ["32", "#6fe3e8"], ["50", "#9be15d"], ["65", "#ffe27a"], ["80", "#ff9548"], ["95+", "#ff5a5a"]].map(([l, c]) => `<span><i style="background:${c};border-radius:50%"></i>${l}</span>`).join("")}</div>`);
     if (state.on.lightning && state.glm && (state.glm.missing || state.glm.lag > state.glm.windowMinutes + 10)) {
       // Every flash is older than the page draws, so say why the map shows none.
       const g = state.glm;
@@ -437,6 +599,15 @@
 
   // Popup content arrives after the popup opens, so links inside it are handled by delegation.
   map.getContainer().addEventListener("click", (ev) => {
+    const w = ev.target.closest(".leaflet-popup [data-watch]");
+    if (w) {
+      ev.preventDefault();
+      const [lat, lon] = w.dataset.watch.split(",").map(Number);
+      setPlace({ label: w.dataset.label || null, lat, lon });
+      map.closePopup();
+      setView("place");
+      return;
+    }
     if (!ev.target.closest(".leaflet-popup [data-forecast]")) return;
     ev.preventDefault();
     setView("forecast");
@@ -560,7 +731,7 @@
 
   // —— Sidebar ——————————————————————————————————————————————————————
   function render() {
-    const html = state.view === "alerts" ? alertsView() : state.view === "outlook" ? outlookView() : state.view === "forecast" ? forecastView() : reportsView();
+    const html = state.view === "alerts" ? alertsView() : state.view === "outlook" ? outlookView() : state.view === "forecast" ? forecastView() : state.view === "place" ? placeView() : reportsView();
     $("panel").innerHTML = html;
     filterAlertLayer();
   }
@@ -590,6 +761,32 @@
   $("panel").addEventListener("click", async (e) => {
     const t = e.target.closest("button, tr");
     if (!t) return;
+    if (t.dataset.afd) { loadAfd(t.dataset.afd); return; }
+    if (t.dataset.afdClose) { state.afd.status = "closed"; render(); return; }
+    if (t.dataset.locate) {
+      if (!navigator.geolocation) { setStatus("Location isn't available in this browser"); return; }
+      setStatus("Finding your location…");
+      navigator.geolocation.getCurrentPosition((pos) => {
+        setStatus("");
+        setPlace({ label: "My location", lat: pos.coords.latitude, lon: pos.coords.longitude });
+        map.flyTo([pos.coords.latitude, pos.coords.longitude], 8, { duration: 0.6 });
+        render();
+      }, () => setStatus("Couldn't get your location"), { timeout: 15000 });
+      return;
+    }
+    if (t.dataset.saved) { const sp = savedPlace(); if (sp) { setPlace(sp); map.flyTo([sp.lat, sp.lon], 8, { duration: 0.6 }); render(); } return; }
+    if (t.dataset.clear) { state.place = null; drawPlace(); render(); return; }
+    if (t.dataset.goalert) {
+      const a = state.alerts.find((x) => x.id === t.dataset.goalert);
+      if (a) { state.view = "alerts"; if (!GROUPS[state.group].test(a.event)) state.group = MARINE.test(a.event) ? "marine" : "land"; state.openEvent = a.event; setView("alerts"); selectAlert(a.id); }
+      return;
+    }
+    if (t.dataset.forecastHere) {
+      const p = state.place;
+      await loadPointForecast(L.latLng(p.lat, p.lon)).catch(() => null);
+      setView("forecast");
+      return;
+    }
     if (t.dataset.group) { state.group = t.dataset.group; state.openEvent = null; render(); return; }
     if (t.dataset.event) { state.openEvent = state.openEvent === t.dataset.event ? null : t.dataset.event; state.selectedAlert = null; layers.highlight.clearLayers(); render(); return; }
     if (t.dataset.alert) { selectAlert(t.dataset.alert); return; }
@@ -613,13 +810,24 @@
     }
   });
 
+  $("panel").addEventListener("change", async (e) => {
+    if (!e.target.dataset?.notify || !state.place) return;
+    if (e.target.checked && Notification.permission !== "granted") {
+      const perm = await Notification.requestPermission().catch(() => "denied");
+      if (perm !== "granted") { e.target.checked = false; setStatus("Notifications are blocked for this site"); setTimeout(() => setStatus(""), 4000); return; }
+    }
+    state.place.notify = e.target.checked;
+    if (state.place.notify) (state.place.alerts || []).forEach((a) => state.place.seen.add(a.id));
+  });
+
   $("layers").addEventListener("change", (e) => {
     const k = e.target.dataset?.layer;
     if (!k) return;
     state.on[k] = e.target.checked;
     if (k === "radar") { loadRadar(true); return; }
     e.target.checked ? layers[k].addTo(map) : layers[k].remove();
-    if (k === "lightning") drawLegend();
+    if (k === "obs" && e.target.checked) loadObs().catch(() => setStatus("Surface observations unavailable"));
+    if (k === "lightning" || k === "obs") drawLegend();
   });
 
   // —— Load & refresh ———————————————————————————————————————————————
@@ -632,11 +840,24 @@
     render();
 
     setInterval(() => loadAlerts().then(render).catch(() => {}), 2 * 60000);
+    setInterval(() => refreshPlace(false), 2 * 60000);
+    setInterval(() => { if (state.on.obs) loadObs().catch(() => {}); }, 10 * 60000);
     setInterval(() => { loadMds().catch(() => {}); loadReports().then(() => { if (state.view === "reports") render(); }).catch(() => {}); }, 5 * 60000);
     setInterval(() => { loadOutlook().then(() => { if (state.view === "outlook") render(); }).catch(() => {}); }, 15 * 60000);
     setInterval(() => { if (!state.radar.timer) loadRadar(false); }, 4 * 60000);
     setInterval(() => loadLightning().catch(() => {}), 2 * 60000);
     setInterval(() => { if (state.swath.hail !== "off" || state.swath.rot !== "off") redrawSwaths(); }, 5 * 60000);
+  }
+
+  // ?loc=lat,lon (from PastWeather and the other pages) watches that spot.
+  const locParam = new URLSearchParams(location.search).get("loc")?.match(/^(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)$/);
+  if (locParam) {
+    const lat = +locParam[1], lon = +locParam[2];
+    const sp = savedPlace();
+    setPlace({ label: sp && Math.abs(sp.lat - lat) < 1e-3 && Math.abs(sp.lon - lon) < 1e-3 ? sp.label : null, lat, lon });
+    state.view = "place";
+    document.querySelectorAll("#views button").forEach((b) => b.setAttribute("aria-selected", b.dataset.view === "place"));
+    map.setView([lat, lon], 8);
   }
 
   init();

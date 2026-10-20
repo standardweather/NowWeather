@@ -5,6 +5,10 @@
  *   nowCOAST (NOAA)                  watches/warnings/advisories map layer in NWS colors; radar mosaic loop
  *   SPC (spc.noaa.gov)               convective outlooks (GeoJSON + text), today's/yesterday's storm reports
  *   NOAA map services                SPC mesoscale discussions
+ *   NOAA MRMS (noaa-mrms-pds)        hail-size and rotation swaths, decoded in the browser by /js/mrms.js
+ *   NWS API points/forecast          forecast for any clicked spot
+ * Collected every ~5 minutes by GitHub Actions into data/glm.json (collect_glm.py):
+ *   NOAA GOES Geostationary Lightning Mapper flashes
  */
 (() => {
   "use strict";
@@ -81,7 +85,9 @@
     alerts: [], alertsTime: null,
     outlookDay: "1", outlookType: "cat", outlookGeo: null, outlookText: "",
     mds: null, reportsDay: "today", reports: null,
-    on: { radar: true, alerts: true, outlook: false, mds: true, reports: true },
+    on: { radar: true, alerts: true, outlook: false, mds: true, reports: true, lightning: true },
+    swath: { hail: "off", rot: "off" },
+    point: null, glm: null,
     radar: { times: [], layers: [], idx: 0, timer: null, opacity: 0.75 },
   };
 
@@ -89,7 +95,7 @@
   const map = L.map("map", { zoomControl: false, minZoom: 3, maxZoom: 12 }).fitBounds(CONUS);
   L.control.zoom({ position: "topright" }).addTo(map);
   map.attributionControl.setPrefix("");
-  [["radar", 300], ["outlook", 350], ["alerts", 400], ["highlight", 450], ["mds", 460], ["points", 620], ["labels", 640]]
+  [["radar", 300], ["swath", 330], ["outlook", 350], ["alerts", 400], ["highlight", 450], ["mds", 460], ["lightning", 600], ["points", 620], ["labels", 640]]
     .forEach(([n, z]) => { map.createPane(n).style.zIndex = z; });
   map.getPane("labels").style.pointerEvents = "none";
   map.getPane("alerts").style.pointerEvents = "none";
@@ -97,7 +103,11 @@
   L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}", { maxZoom: 16, pane: "labels", opacity: 0.85 }).addTo(map);
   map.attributionControl.addAttribution("NWS · SPC · NOAA nowCOAST");
 
+  const lightningCanvas = L.canvas({ pane: "lightning", padding: 0.3 });
   const layers = {
+    lightning: L.layerGroup(),
+    hail: L.layerGroup().addTo(map),
+    rot: L.layerGroup().addTo(map),
     alerts: L.tileLayer.wms(`${NOWCOAST}/alerts/wms`, { layers: "watches_warnings_advisories", format: "image/png", transparent: true, version: "1.3.0", pane: "alerts", opacity: 0.6, tileSize: 512, attribution: "" }),
     outlook: L.layerGroup(),
     mds: L.layerGroup(),
@@ -264,27 +274,167 @@
   }
 
   // Click the map: identify alerts at that point from the nowCOAST layer.
+  // Click the map: alerts at that spot (nowCOAST identify) and the NWS forecast there.
   map.on("click", async (e) => {
-    if (!state.on.alerts) return;
+    const popup = L.popup({ maxWidth: 340 }).setLatLng(e.latlng).setContent(`<p>Loading…</p>`).openOn(map);
+    const [alertsHtml, fc] = await Promise.all([identifyAlerts(e.latlng).catch(() => ""), loadPointForecast(e.latlng).catch(() => null)]);
+    const fcHtml = fc && fc.periods.length
+      ? `<h4>Forecast · ${esc(fc.place)}</h4>${fc.periods.slice(0, 2).map((p) => `<p><b>${esc(p.name)}</b> ${p.temperature}°${esc(p.temperatureUnit)} · ${esc(p.shortForecast)} · wind ${esc(p.windSpeed)}</p>`).join("")}
+        <p><a href="#" data-forecast="1">7-day and hourly forecast</a></p>`
+      : `<p>No NWS forecast for this spot (outside the US forecast area).</p>`;
+    popup.setContent([alertsHtml, fcHtml].filter(Boolean).join("<hr>"));
+    if (state.view === "forecast") render();
+  });
+
+  async function identifyAlerts(latlng) {
+    if (!state.on.alerts) return "";
     const size = map.getSize();
     const b = map.getBounds();
-    const p = map.latLngToContainerPoint(e.latlng);
+    const p = map.latLngToContainerPoint(latlng);
     const url = `${NOWCOAST}/alerts/wms?service=WMS&version=1.3.0&request=GetFeatureInfo&layers=watches_warnings_advisories&query_layers=watches_warnings_advisories` +
       `&info_format=application/json&feature_count=20&crs=EPSG:4326&bbox=${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}` +
       `&width=${size.x}&height=${size.y}&i=${Math.round(p.x)}&j=${Math.round(p.y)}` + (lastFilter ? `&CQL_FILTER=${encodeURIComponent(lastFilter)}` : "");
+    const d = await (await fetch(url)).json();
+    const seen = new Set();
+    const feats = d.features.map((f) => f.properties).filter((p2) => !seen.has(p2.cap_id) && seen.add(p2.cap_id))
+      .sort((x, y) => rank(x.prod_type) - rank(y.prod_type));
+    return feats.map((p2) => {
+      const a = state.alerts.find((x) => x.id === p2.cap_id);
+      return `<h4><span class="dot" style="background:${colorOf(p2.prod_type)}"></span>${esc(p2.prod_type)}</h4>
+        <p>${esc(a ? a.senderName.replace("NWS ", "") : p2.wfo)} · until ${esc(dayZ(p2.ends || p2.expiration))}${a ? ` · <a href="#" data-open="${esc(a.id)}">details</a>` : ""}</p>`;
+    }).join("");
+  }
+
+  // —— Point forecast (NWS API) ———————————————————————————————————————
+  async function loadPointForecast(latlng) {
+    const pt = await (await fetch(`${NWS}/points/${latlng.lat.toFixed(4)},${latlng.lng.toFixed(4)}`)).json();
+    const pr = pt.properties;
+    if (!pr?.forecast) return null;
+    const [daily, hourly] = await Promise.all([pr.forecast, pr.forecastHourly].map((u) => fetch(u).then((r) => (r.ok ? r.json() : null)).catch(() => null)));
+    const rel = pr.relativeLocation?.properties;
+    const fc = {
+      lat: latlng.lat, lon: latlng.lng,
+      place: rel ? `${rel.city}, ${rel.state}` : `${latlng.lat.toFixed(2)}, ${latlng.lng.toFixed(2)}`,
+      office: pr.gridId, link: `https://forecast.weather.gov/MapClick.php?lat=${latlng.lat.toFixed(4)}&lon=${latlng.lng.toFixed(4)}`,
+      updated: daily?.properties?.updateTime, periods: daily?.properties?.periods || [], hourly: (hourly?.properties?.periods || []).slice(0, 48),
+    };
+    state.point = fc;
+    layers.highlight.clearLayers();
+    L.circleMarker([fc.lat, fc.lon], { pane: "points", radius: 6, color: "#fff", weight: 2, fillColor: "#4ad1ff", fillOpacity: 1, interactive: false }).addTo(layers.highlight);
+    return fc;
+  }
+
+  function hourlyChart(h) {
+    if (h.length < 2) return "";
+    const W = 336, H = 130, L0 = 26, R0 = 24, T0 = 8, B0 = 18;
+    const temps = h.map((p) => p.temperature);
+    const lo = Math.floor((Math.min(...temps) - 3) / 5) * 5, hi = Math.ceil((Math.max(...temps) + 3) / 5) * 5;
+    const x = (i) => L0 + (i / (h.length - 1)) * (W - L0 - R0);
+    const y = (v) => T0 + (1 - (v - lo) / (hi - lo)) * (H - T0 - B0);
+    const yp = (v) => T0 + (1 - v / 100) * (H - T0 - B0);
+    const mono = 'font-family="IBM Plex Mono, monospace" font-size="9.5" fill="rgba(255,255,255,.42)"';
+    let svg = "";
+    for (let v = lo; v <= hi; v += (hi - lo) > 30 ? 10 : 5) svg += `<line x1="${L0}" x2="${W - R0}" y1="${y(v)}" y2="${y(v)}" stroke="rgba(255,255,255,.07)"/><text x="${L0 - 5}" y="${y(v) + 3}" text-anchor="end" ${mono}>${v}°</text>`;
+    [0, 50, 100].forEach((v) => { svg += `<text x="${W - R0 + 4}" y="${yp(v) + 3}" ${mono} fill="#4ad1ff">${v}%</text>`; });
+    h.forEach((p, i) => {
+      const pop = p.probabilityOfPrecipitation?.value || 0;
+      if (pop) svg += `<rect x="${(x(i) - 2.4).toFixed(1)}" y="${yp(pop).toFixed(1)}" width="4.8" height="${(H - B0 - yp(pop)).toFixed(1)}" fill="rgba(74,209,255,.35)"/>`;
+      const d = new Date(p.startTime);
+      if (d.getHours() % 12 === 0) svg += `<text x="${x(i).toFixed(1)}" y="${H - 4}" text-anchor="middle" ${mono}>${d.toLocaleTimeString("en-US", { hour: "numeric" }).replace(":00", "")}</text>`;
+    });
+    svg += `<polyline fill="none" stroke="#ffbf47" stroke-width="2" points="${h.map((p, i) => `${x(i).toFixed(1)},${y(p.temperature).toFixed(1)}`).join(" ")}"/>`;
+    return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Hourly temperature and precipitation chance">${svg}</svg>
+      <p class="chart-key"><span style="color:#ffbf47">━</span> temperature &nbsp;<span style="color:#4ad1ff">▮</span> chance of precipitation · next 48 hours, local time</p>`;
+  }
+
+  function forecastView() {
+    const f = state.point;
+    if (!f) return `<p class="empty">Click anywhere on the map for the National Weather Service forecast at that spot.</p>`;
+    return `<div class="pad"><h5 class="sub">${esc(f.place)} · NWS ${esc(f.office)}${f.updated ? ` · updated ${esc(dayZ(f.updated))}` : ""}</h5>
+      ${hourlyChart(f.hourly)}
+      <table class="t" style="margin-top:.6rem"><tbody>${f.periods.map((p, i) => `<tr data-period="${i}"><td style="width:6.5rem"><b style="color:#fff">${esc(p.name)}</b><small>${p.probabilityOfPrecipitation?.value ? `${p.probabilityOfPrecipitation.value}% precip` : ""}</small></td>
+        <td style="width:3rem;color:${p.isDaytime ? "#ffbf47" : "#7cb8ff"}">${p.temperature}°</td><td>${esc(p.shortForecast)}<small>${esc(p.windDirection)} ${esc(p.windSpeed)}</small>
+        ${state.openPeriod === i ? `<small style="color:var(--text2);margin-top:.3rem">${esc(p.detailedForecast)}</small>` : ""}</td></tr>`).join("")}</tbody></table>
+      <p class="note"><a href="${esc(f.link)}" target="_blank" rel="noopener">Full forecast at weather.gov ↗</a></p></div>`;
+  }
+
+  // —— Hail and rotation swaths (NOAA MRMS, decoded for the current view) ———————————
+  const SWATH = { hail60: "Hail size, last hour", hail: "Hail size, last 24 h", rotation60: "Rotation, last hour", rotation: "Rotation, last 24 h" };
+  let swathTimer = null;
+  async function drawSwath(kind) {
+    const name = state.swath[kind];
+    const group = layers[kind];
+    if (name === "off") { group.clearLayers(); drawLegend(); return; }
+    const b = map.getBounds().pad(0.15);
+    const bounds = { south: Math.max(20, b.getSouth()), north: Math.min(55, b.getNorth()), west: Math.max(-130, b.getWest()), east: Math.min(-60, b.getEast()) };
+    if (bounds.north <= bounds.south || bounds.east <= bounds.west) { group.clearLayers(); return; }
+    setStatus(`Loading ${SWATH[name].toLowerCase()}…`);
     try {
-      const d = await (await fetch(url)).json();
-      const seen = new Set();
-      const feats = d.features.map((f) => f.properties).filter((p2) => !seen.has(p2.cap_id) && seen.add(p2.cap_id))
-        .sort((x, y) => rank(x.prod_type) - rank(y.prod_type));
-      if (!feats.length) return;
-      const html = feats.map((p2) => {
-        const a = state.alerts.find((x) => x.id === p2.cap_id);
-        return `<h4><span class="dot" style="background:${colorOf(p2.prod_type)}"></span>${esc(p2.prod_type)}</h4>
-          <p>${esc(a ? a.senderName.replace("NWS ", "") : p2.wfo)} · until ${esc(dayZ(p2.ends || p2.expiration))}${a ? ` · <a href="#" data-open="${esc(a.id)}">details</a>` : ""}</p>`;
-      }).join("");
-      L.popup({ maxWidth: 320 }).setLatLng(e.latlng).setContent(html).openOn(map);
-    } catch { /* identify is best-effort */ }
+      const f = await MRMS.fetchProduct(name, new Date().toISOString(), null, null, { bounds, maxPixels: 1400, mode: "atOrBefore", maxMinutes: name.endsWith("60") ? 30 : 90 });
+      if (state.swath[kind] !== name) return;
+      group.clearLayers();
+      if (f) L.imageOverlay(f.url, f.bounds, { pane: "swath", opacity: f.opacity, interactive: false }).addTo(group);
+      state.swath[`${kind}Time`] = f?.timeIso || null;
+    } catch { /* leave the previous image */ }
+    setStatus("");
+    drawLegend();
+  }
+  const redrawSwaths = () => { clearTimeout(swathTimer); swathTimer = setTimeout(() => { drawSwath("hail"); drawSwath("rot"); }, 400); };
+  map.on("moveend", () => { if (state.swath.hail !== "off" || state.swath.rot !== "off") redrawSwaths(); });
+
+  ["hail", "rot"].forEach((kind) => {
+    $(`${kind}pick`).addEventListener("click", (e) => {
+      const v = e.target.closest("[data-v]")?.dataset.v;
+      if (!v) return;
+      state.swath[kind] = v;
+      document.querySelectorAll(`#${kind}pick [data-v]`).forEach((b2) => b2.setAttribute("aria-pressed", b2.dataset.v === v));
+      drawSwath(kind);
+    });
+  });
+
+  // —— Lightning (NOAA GOES GLM, collected by collect_glm.py) ————————————————
+  const AGE_COLOR = (m) => (m < 5 ? "#ffffff" : m < 10 ? "#ffe27a" : "#ff9548");
+  async function loadLightning() {
+    const res = await fetch(`data/glm.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const d = await res.json();
+    const lag = (Date.now() - Date.parse(d.generated)) / 60000;
+    state.glm = { ...d, lag };
+    layers.lightning.clearLayers();
+    for (const [lat, lon, n, age] of d.cells) {
+      const total = age + lag;
+      if (total > d.windowMinutes + 10) continue;
+      L.circleMarker([lat, lon], { renderer: lightningCanvas, radius: Math.min(6, 1.6 + Math.log2(n)), weight: 0, fillColor: AGE_COLOR(total), fillOpacity: 0.9, interactive: false }).addTo(layers.lightning);
+    }
+    drawLegend();
+  }
+
+  // —— Map legend ———————————————————————————————————————————————————
+  const Legend = L.Control.extend({ options: { position: "bottomright" }, onAdd() { const d = L.DomUtil.create("div", "maplegend"); d.id = "legend"; return d; } });
+  new Legend().addTo(map);
+  function drawLegend() {
+    const parts = [];
+    const sw = (name, kind) => {
+      if (name === "off") return;
+      const stops = name.startsWith("hail") ? MRMS.legends.hail.map(([v, c]) => [`${v.toFixed(2).replace(/0$/, "")}"`, c]) : MRMS.legends.rotation.map(([v, c]) => [`${v}`, c]);
+      const t = state.swath[`${kind}Time`];
+      parts.push(`<h5 class="sub">${esc(SWATH[name])}${name.startsWith("rot") ? " (×10⁻³ s⁻¹)" : ""}${t ? ` · to ${hhmmZ(t)}` : ""}</h5><div class="key">${stops.map(([l, c]) => `<span><i style="background:rgb(${c})"></i>${l}+</span>`).join("")}</div>`);
+    };
+    sw(state.swath.hail, "hail");
+    sw(state.swath.rot, "rot");
+    if (state.on.lightning && state.glm) {
+      const g = state.glm;
+      parts.push(`<h5 class="sub">Lightning (GOES GLM) · ${g.flashes} flashes${g.lag > 20 ? ` · ${Math.round(g.lag)} min old` : ""}</h5><div class="key"><span><i style="background:#fff;border-radius:50%"></i>&lt; 5 min</span><span><i style="background:#ffe27a;border-radius:50%"></i>5–10</span><span><i style="background:#ff9548;border-radius:50%"></i>10–15+</span></div>`);
+    }
+    $("legend").innerHTML = parts.join("");
+  }
+
+  // Popup content arrives after the popup opens, so links inside it are handled by delegation.
+  map.getContainer().addEventListener("click", (ev) => {
+    if (!ev.target.closest(".leaflet-popup [data-forecast]")) return;
+    ev.preventDefault();
+    setView("forecast");
+    map.closePopup();
   });
   map.on("popupopen", (e) => {
     e.popup.getElement().querySelectorAll("[data-open]").forEach((el) => {
@@ -404,7 +554,7 @@
 
   // —— Sidebar ——————————————————————————————————————————————————————
   function render() {
-    const html = state.view === "alerts" ? alertsView() : state.view === "outlook" ? outlookView() : reportsView();
+    const html = state.view === "alerts" ? alertsView() : state.view === "outlook" ? outlookView() : state.view === "forecast" ? forecastView() : reportsView();
     $("panel").innerHTML = html;
     filterAlertLayer();
   }
@@ -450,6 +600,7 @@
       return;
     }
     if (t.dataset.rday) { state.reportsDay = t.dataset.rday; await loadReports().catch(() => {}); render(); return; }
+    if (t.dataset.period) { const i = +t.dataset.period; state.openPeriod = state.openPeriod === i ? null : i; render(); return; }
     if (t.dataset.ll) {
       const [lat, lon] = t.dataset.ll.split(",").map(Number);
       map.flyTo([lat, lon], Math.max(map.getZoom(), 8), { duration: 0.6 });
@@ -462,13 +613,15 @@
     state.on[k] = e.target.checked;
     if (k === "radar") { loadRadar(true); return; }
     e.target.checked ? layers[k].addTo(map) : layers[k].remove();
+    if (k === "lightning") drawLegend();
   });
 
   // —— Load & refresh ———————————————————————————————————————————————
   async function init() {
     loadRadar(true);
     setStatus("Loading alerts…");
-    const results = await Promise.allSettled([loadAlerts(), loadOutlook(), loadMds(), loadReports()]);
+    if (state.on.lightning) layers.lightning.addTo(map);
+    const results = await Promise.allSettled([loadAlerts(), loadOutlook(), loadMds(), loadReports(), loadLightning()]);
     setStatus(results[0].status === "rejected" ? "NWS alerts unavailable — try again shortly" : "");
     render();
 
@@ -476,6 +629,8 @@
     setInterval(() => { loadMds().catch(() => {}); loadReports().then(() => { if (state.view === "reports") render(); }).catch(() => {}); }, 5 * 60000);
     setInterval(() => { loadOutlook().then(() => { if (state.view === "outlook") render(); }).catch(() => {}); }, 15 * 60000);
     setInterval(() => { if (!state.radar.timer) loadRadar(false); }, 4 * 60000);
+    setInterval(() => loadLightning().catch(() => {}), 2 * 60000);
+    setInterval(() => { if (state.swath.hail !== "off" || state.swath.rot !== "off") redrawSwaths(); }, 5 * 60000);
   }
 
   init();

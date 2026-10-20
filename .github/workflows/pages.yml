@@ -1,7 +1,11 @@
 name: Deploy to GitHub Pages
 
-# The page reads all of its data live in the browser, so a deploy is only needed when the page changes.
+# Most of the page reads its data live in the browser. Lightning (NOAA GOES GLM) arrives as netCDF,
+# which browsers can't read, so collect_glm.py summarizes it into data/glm.json on every run.
+# GitHub may start scheduled runs several minutes late; the page shows the lightning's age.
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   push:
     branches: [main]
   workflow_dispatch:
@@ -18,11 +22,18 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python collect_glm.py
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

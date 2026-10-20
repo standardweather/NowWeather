@@ -50,6 +50,7 @@
         <button role="tab" data-view="alerts" aria-selected="true">Alerts</button>
         <button role="tab" data-view="outlook" aria-selected="false">SPC outlook</button>
         <button role="tab" data-view="reports" aria-selected="false">Storm reports</button>
+        <button role="tab" data-view="forecast" aria-selected="false">Forecast</button>
       </div>
       <div class="scroll" id="panel"><p class="empty">Loading…</p></div>
       <div class="side__foot">
@@ -60,7 +61,10 @@
           <label><input type="checkbox" data-layer="outlook" /> SPC outlook</label>
           <label><input type="checkbox" data-layer="mds" checked /> Mesoscale discussions</label>
           <label><input type="checkbox" data-layer="reports" checked /> Storm reports</label>
+          <label><input type="checkbox" data-layer="lightning" checked /> Lightning (15 min)</label>
         </div>
+        <div class="satpick" id="hailpick" role="group" aria-label="Hail size"><span>Hail size</span><button data-v="off" aria-pressed="true">Off</button><button data-v="hail60" aria-pressed="false">Last hour</button><button data-v="hail" aria-pressed="false">24 h</button></div>
+        <div class="satpick" id="rotpick" role="group" aria-label="Rotation"><span>Rotation</span><button data-v="off" aria-pressed="true">Off</button><button data-v="rotation60" aria-pressed="false">Last hour</button><button data-v="rotation" aria-pressed="false">24 h</button></div>
         <p class="disclaimer">Not an official product. Decisions should rely on the <a href="https://www.weather.gov/">National Weather Service</a>.</p>
       </div>
     </aside>
@@ -82,6 +86,7 @@
   </footer>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="app.js"></script>
+  <script src="/js/mrms.js?v=1"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>

@@ -7,6 +7,7 @@
  *   NOAA map services                SPC mesoscale discussions
  *   NOAA MRMS (noaa-mrms-pds)        hail-size and rotation swaths, decoded in the browser by /js/mrms.js
  *   NWS API points/forecast          forecast and area forecast discussion for any clicked spot; alerts at "My place"
+ *                                    and arrival times from the storm motion in each warning
  *   NOAA map services (AWC METARs)   surface observations layer
  * Collected every ~5 minutes by GitHub Actions into data/glm.json (collect_glm.py):
  *   NOAA GOES Geostationary Lightning Mapper flashes
@@ -118,6 +119,7 @@
     highlight: L.layerGroup().addTo(map),
     obs: L.layerGroup(),
     place: L.layerGroup().addTo(map),
+    tracks: L.layerGroup().addTo(map),
   };
   Object.entries(state.on).forEach(([k, v]) => { if (v && layers[k]) layers[k].addTo(map); });
 
@@ -427,6 +429,7 @@
     p.alerts = alerts;
     p.radar = radar;
     p.checked = new Date().toISOString();
+    drawStormTracks();
     if (state.view === "place") render();
     notifyPlace(first);
   }
@@ -444,6 +447,90 @@
     }
     return { near, n10, n30 };
   }
+  // —— Storm arrival: NWS warnings carry the storm's position, heading and speed (eventMotionDescription) ———————
+  // e.g. "2021-12-11T03:26:00-00:00...storm...236DEG...48KT...36.75,-88.65". The heading is where the storm is
+  // moving from, as in the warning's TIME...MOT...LOC line. Several positions mean a line of storms.
+  function stormMotion(a) {
+    const m = (a.parameters?.eventMotionDescription || [])[0]?.match(/^(\S+?)\.\.\.(\w+)\.\.\.(\d+)DEG\.\.\.(\d+)KT\.\.\.(.+)$/);
+    if (!m) return null;
+    const pts = m[5].trim().split(/\s+/).map((ll) => ll.split(",").map(Number)).filter(([la, lo]) => isFinite(la) && isFinite(lo));
+    const t = Date.parse(m[1]);
+    if (!pts.length || !isFinite(t)) return null;
+    return { t, kind: m[2], from: +m[3], kt: +m[4], pts };
+  }
+  const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  const compass = (deg) => COMPASS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+
+  /**
+   * When a warned storm reaches the place, if it keeps its heading and speed. Works in km on a flat projection
+   * around the place: "along" is distance along the storm's track (negative = storm still upstream), "cross" is
+   * the sideways miss distance. For a line of storms, the line reaches the place where it crosses the track
+   * through the place; otherwise the nearest end of the line is used.
+   */
+  function stormArrival(mo, p, now = Date.now()) {
+    const kx = 111.32 * Math.cos((p.lat * Math.PI) / 180), ky = 110.57;
+    const toward = ((mo.from + 180) * Math.PI) / 180;
+    const u = [Math.sin(toward), Math.cos(toward)];
+    const kmh = mo.kt * 1.852;
+    const ac = mo.pts.map(([la, lo]) => {
+      const dx = (lo - p.lon) * kx, dy = (la - p.lat) * ky;
+      return { along: dx * u[0] + dy * u[1], cross: dx * u[1] - dy * u[0] };
+    });
+    let hit = null;
+    for (let i = 0; i < ac.length - 1 && !hit; i++) {
+      const [a, b] = [ac[i], ac[i + 1]];
+      if ((a.cross <= 0 && b.cross >= 0) || (a.cross >= 0 && b.cross <= 0)) {
+        const f = a.cross === b.cross ? 0 : a.cross / (a.cross - b.cross);
+        hit = { along: a.along + f * (b.along - a.along), cross: 0 };
+      }
+    }
+    if (!hit) hit = ac.reduce((best, c) => (Math.abs(c.cross) < Math.abs(best.cross) ? c : best));
+    if (!kmh) return null;
+    const eta = mo.t + (-hit.along / kmh) * 3600000;
+    const side = hit.cross === 0 ? "" : compass((toward * 180) / Math.PI + (hit.cross > 0 ? 90 : -90));
+    return { eta, missKm: Math.abs(hit.cross), side, minutes: (eta - now) / 60000, mph: Math.round(mo.kt * 1.15078), toward: compass((toward * 180) / Math.PI), line: mo.pts.length > 1 };
+  }
+  const STORM_EVENTS = /Tornado Warning|Severe Thunderstorm Warning|Extreme Wind Warning|Special Weather Statement|Special Marine Warning|Severe Weather Statement/;
+  /** Warned storms on course to pass within 15 miles in the next 3 hours (or that passed in the last 15 minutes). */
+  function approachingStorms(p) {
+    const out = [];
+    for (const a of state.alerts) {
+      if (!STORM_EVENTS.test(a.event)) continue;
+      const mo = stormMotion(a);
+      if (!mo) continue;
+      if (kmBetween(p.lat, p.lon, mo.pts[0][0], mo.pts[0][1]) > 500) continue;
+      const r = stormArrival(mo, p);
+      if (!r || r.missKm > 24.1 || r.minutes < -15 || r.minutes > 180) continue;
+      out.push({ a, mo, ...r });
+    }
+    return out.sort((x, y) => x.eta - y.eta);
+  }
+  function drawStormTracks() {
+    layers.tracks.clearLayers();
+    const p = state.place;
+    if (!p) return;
+    approachingStorms(p).forEach((s) => {
+      const toward = ((s.mo.from + 180) * Math.PI) / 180;
+      const kx = 111.32 * Math.cos((p.lat * Math.PI) / 180);
+      const km = (s.mo.kt * 1.852 * Math.max(0, s.eta - s.mo.t + 30 * 60000)) / 3600000;
+      const color = colorOf(s.a.event);
+      s.mo.pts.forEach(([la, lo]) => {
+        const end = [la + (km * Math.cos(toward)) / 110.57, lo + (km * Math.sin(toward)) / kx];
+        L.polyline([[la, lo], end], { pane: "points", color, weight: 2, dashArray: "6 6", opacity: 0.9, interactive: false }).addTo(layers.tracks);
+      });
+      L.polyline(s.mo.pts, { pane: "points", color, weight: 4, opacity: 0.95 })
+        .bindTooltip(`${esc(s.a.event)} · ${esc(etaText(s))}`, { className: "tw-tip", sticky: true }).addTo(layers.tracks);
+      if (s.mo.pts.length === 1) L.circleMarker(s.mo.pts[0], { pane: "points", radius: 6, color, weight: 2, fillColor: "#060818", fillOpacity: 1 })
+        .bindTooltip(`${esc(s.a.event)} · ${esc(etaText(s))}`, { className: "tw-tip" }).addTo(layers.tracks);
+    });
+  }
+  const localTime = (ms) => new Date(ms).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  function etaText(s) {
+    if (s.minutes < 0) return `passed about ${Math.round(-s.minutes)} min ago`;
+    const plus = Math.max(5, Math.round((s.minutes * 0.2) / 5) * 5);
+    return `about ${localTime(s.eta)} (${hhmmZ(s.eta)}), in ${Math.round(s.minutes)} min ±${plus}`;
+  }
+
   function notifyPlace(first) {
     const p = state.place;
     if (!p?.notify || typeof Notification === "undefined" || Notification.permission !== "granted") return;
@@ -453,7 +540,130 @@
     const msgs = first ? [] : fresh.map((a) => `${a.event} until ${dayZ(a.expires)}`);
     if (!first && lt?.n10 && !p.lightningWarned) { msgs.push(`Lightning within 10 miles (${lt.n10} flashes in 15 min)`); p.lightningWarned = true; }
     if (lt && !lt.n10) p.lightningWarned = false;
+    approachingStorms(p).filter((s) => s.minutes > 0 && s.minutes <= 60 && !p.seen.has(`eta:${s.a.id}`)).forEach((s) => {
+      p.seen.add(`eta:${s.a.id}`);
+      if (!first) msgs.push(`${s.a.event} storm reaches you ${etaText(s)}`);
+    });
     msgs.forEach((m) => { try { new Notification(`NowWeather · ${p.label}`, { body: m, icon: "/assets/icon-192.png" }); } catch { /* not allowed here */ } });
+  }
+
+  // —— Storm log: a timestamped record of conditions at the place every 5 minutes while the page is open ——————
+  // Kept in this browser (localStorage) so a reload doesn't lose it. Each row: alerts in effect, radar and MRMS
+  // hail at the spot, nearby lightning, and the latest reading at the nearest NWS observing station.
+  const LOG_KEY = "sw-stormlog";
+  const LOG_EVERY = 5 * 60000;
+  let logTimer = null;
+  function loadLog() { try { return JSON.parse(localStorage.getItem(LOG_KEY) || "null"); } catch { return null; } }
+  function saveLog() { try { localStorage.setItem(LOG_KEY, JSON.stringify(state.log)); } catch { /* full or private mode */ } }
+  state.log = loadLog();
+
+  async function nearestStation(p) {
+    if (p.station !== undefined) return p.station;
+    p.station = null;
+    try {
+      const pt = await (await fetch(`${NWS}/points/${p.lat.toFixed(4)},${p.lon.toFixed(4)}`)).json();
+      const list = await (await fetch(pt.properties.observationStations)).json();
+      const f = list.features?.[0];
+      if (f) p.station = { id: f.properties.stationIdentifier, name: f.properties.name, km: kmBetween(p.lat, p.lon, f.geometry.coordinates[1], f.geometry.coordinates[0]) };
+    } catch { /* outside the NWS area */ }
+    return p.station;
+  }
+  const num = (q) => (q && q.value != null ? q.value : null);
+  async function logSample() {
+    const p = state.place, log = state.log;
+    if (!p || !log?.on) return;
+    const st = await nearestStation(p);
+    const inMrms = p.lat > 20 && p.lat < 55 && p.lon > -130 && p.lon < -60;
+    const [obs, hail] = await Promise.all([
+      st ? fetch(`${NWS}/stations/${st.id}/observations/latest`).then((r) => r.json()).then((d) => d.properties).catch(() => null) : null,
+      inMrms ? MRMS.fetchProduct("hail60", new Date().toISOString(), p.lat, p.lon, { halfLat: 0.2, mode: "atOrBefore", maxMinutes: 30 }).catch(() => null) : null,
+    ]);
+    if (state.log !== log || !log.on) return;
+    const lt = placeLightning(p);
+    const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
+    const kmh2mph = (k) => (k == null ? null : Math.round(k * 0.621371));
+    log.rows.push({
+      t: new Date().toISOString(),
+      alerts: (p.alerts || []).map((a) => a.event).sort((x, y) => rank(x) - rank(y)),
+      eta: approachingStorms(p).filter((x) => x.minutes >= 0).map((x) => `${x.a.event} ${hhmmZ(x.eta)}`),
+      dbz: p.radar?.at > 0 ? Math.round(p.radar.at) : 0, dbzNear: p.radar?.peak > 0 ? Math.round(p.radar.peak) : 0,
+      hail: hail?.at > 0 ? +(hail.at / 25.4).toFixed(2) : 0, hailNear: hail?.peak > 0 ? +(hail.peak / 25.4).toFixed(2) : 0,
+      ltMi: lt?.near ? +mi(lt.near.km) : null, lt10: lt ? lt.n10 : null,
+      stn: st?.id || null, obsT: obs?.timestamp || null, tempF: c2f(num(obs?.temperature)), windMph: kmh2mph(num(obs?.windSpeed)),
+      gustMph: kmh2mph(num(obs?.windGust)), windDir: num(obs?.windDirection), rainIn: num(obs?.precipitationLastHour) != null ? +(num(obs.precipitationLastHour) / 25.4).toFixed(2) : null,
+      wx: obs?.textDescription || "",
+    });
+    if (log.rows.length > 2000) log.rows.shift();
+    saveLog();
+    if (state.view === "place") render();
+  }
+  function startLog() {
+    const p = state.place;
+    if (!p) return;
+    const same = state.log && Math.abs(state.log.lat - p.lat) < 1e-4 && Math.abs(state.log.lon - p.lon) < 1e-4;
+    if (!same) state.log = { label: p.label, lat: p.lat, lon: p.lon, started: new Date().toISOString(), rows: [] };
+    state.log.on = true;
+    saveLog();
+    clearInterval(logTimer);
+    logTimer = setInterval(logSample, LOG_EVERY);
+    logSample();
+  }
+  function stopLog() { if (state.log) { state.log.on = false; saveLog(); } clearInterval(logTimer); logTimer = null; }
+
+  const LOG_COLS = [
+    ["Time (UTC)", (r) => r.t.replace("T", " ").slice(0, 16)], ["Alerts in effect", (r) => r.alerts.join("; ")], ["Storms on the way (arrival UTC)", (r) => (r.eta || []).join("; ")],
+    ["Radar here (dBZ)", (r) => r.dbz], ["Radar within 6 mi (dBZ)", (r) => r.dbzNear], ['MRMS hail here, last hour (in)', (r) => r.hail], ['MRMS hail within 6 mi (in)', (r) => r.hailNear],
+    ["Nearest lightning (mi)", (r) => r.ltMi ?? ""], ["Flashes within 10 mi, 15 min", (r) => r.lt10 ?? ""], ["Station", (r) => r.stn || ""], ["Station obs time (UTC)", (r) => (r.obsT ? r.obsT.replace("T", " ").slice(0, 16) : "")],
+    ["Temp (°F)", (r) => r.tempF ?? ""], ["Wind (mph)", (r) => r.windMph ?? ""], ["Gust (mph)", (r) => r.gustMph ?? ""], ["Wind from (°)", (r) => r.windDir ?? ""], ["Rain last hour (in)", (r) => r.rainIn ?? ""], ["Weather", (r) => r.wx],
+  ];
+  function logCsv() {
+    const q = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+    const head = `# Standard Weather NowWeather storm log · ${state.log.label} (${state.log.lat.toFixed(4)}, ${state.log.lon.toFixed(4)}) · started ${state.log.started}\n`;
+    const blob = new Blob([head + [LOG_COLS.map((c) => q(c[0])).join(","), ...state.log.rows.map((r) => LOG_COLS.map((c) => q(c[1](r))).join(","))].join("\n")], { type: "text/csv" });
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: `storm-log-${state.log.started.slice(0, 10)}.csv` });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  function logPrint() {
+    const l = state.log;
+    const w = window.open("", "_blank");
+    if (!w) { setStatus("Allow pop-ups to print the storm log"); return; }
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Storm log · ${esc(l.label)}</title>
+      <style>body{font:12px/1.4 system-ui,sans-serif;margin:24px;color:#111}h1{font-size:18px;margin:0 0 4px}p{margin:0 0 12px;color:#444}
+      table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:3px 5px;text-align:left;vertical-align:top}th{background:#eee;font-weight:600}</style>
+      <h1>Storm log · ${esc(l.label)}</h1>
+      <p>${l.lat.toFixed(4)}, ${l.lon.toFixed(4)} · started ${esc(l.started.replace("T", " ").slice(0, 16))} UTC · ${l.rows.length} readings, every 5 minutes while NowWeather was open.<br>
+      Sources: NWS alerts and station observations (api.weather.gov), NOAA MRMS radar and hail (noaa-mrms-pds), NOAA GOES lightning. Recorded by Standard Weather NowWeather; not an official record.</p>
+      <table><thead><tr>${LOG_COLS.map((c) => `<th>${esc(c[0])}</th>`).join("")}</tr></thead><tbody>
+      ${l.rows.map((r) => `<tr>${LOG_COLS.map((c) => `<td>${esc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+    w.document.close();
+    w.focus();
+    w.print();
+  }
+  function logHtml(p) {
+    const l = state.log;
+    const here = l && Math.abs(l.lat - p.lat) < 1e-4 && Math.abs(l.lon - p.lon) < 1e-4;
+    const last = here && l.rows[l.rows.length - 1];
+    let html = `<h5 class="sub" style="margin-top:1.1rem">Storm log</h5>`;
+    if (!here || !l.rows.length && !l.on) {
+      html += `<p class="note">Record conditions here every 5 minutes while this page is open: alerts, radar, MRMS hail, lightning and the nearest station's wind, gust and rain. Download it as a spreadsheet or print it for a claim.</p>
+        <div class="actions"><button class="btn" data-log="start">Start storm log</button>${l?.rows?.length && !here ? `<span class="note" style="margin:0">Starting replaces the log for ${esc(l.label)}.</span>` : ""}</div>`;
+      return html;
+    }
+    html += `<p class="note">${l.on ? "<b>Recording</b>" : "Stopped"} · ${l.rows.length} reading${l.rows.length === 1 ? "" : "s"} since ${esc(dayZ(l.started))}${last ? ` · last ${hhmmZ(last.t)}` : ""}. Keep this tab open; it records only while the page is open.</p>`;
+    if (last) {
+      const peak = (k) => Math.max(0, ...l.rows.map((r) => r[k] ?? 0));
+      html += `<table class="t"><tbody>
+        <tr><td>Peak gust at ${esc(last.stn || "station")}</td><td>${peak("gustMph") ? `${peak("gustMph")} mph` : "—"}</td></tr>
+        <tr><td>Largest MRMS hail here</td><td>${peak("hail") ? `${peak("hail")}"` : "None"}</td></tr>
+        <tr><td>Strongest radar here</td><td>${peak("dbz") ? `${peak("dbz")} dBZ` : "No echo"}</td></tr>
+        <tr><td>Closest lightning</td><td>${l.rows.some((r) => r.ltMi != null) ? `${Math.min(...l.rows.filter((r) => r.ltMi != null).map((r) => r.ltMi))} mi` : "None"}</td></tr>
+      </tbody></table>`;
+    }
+    html += `<div class="actions">${l.on ? `<button class="linkish" data-log="stop">Stop</button>` : `<button class="linkish" data-log="start">Resume</button>`}
+      <button class="linkish" data-log="csv"${l.rows.length ? "" : " disabled"}>Download CSV</button><button class="linkish" data-log="print"${l.rows.length ? "" : " disabled"}>Print</button>
+      ${l.on ? "" : `<button class="linkish" data-log="clear">Clear</button>`}</div>`;
+    return html;
   }
 
   function placeView() {
@@ -469,6 +679,9 @@
     if (p.alerts == null) html += `<p class="note">Checking alerts…</p>`;
     else if (!p.alerts.length) html += stat("Alerts", "None", "No NWS watches, warnings or advisories in effect here");
     else html += p.alerts.sort((a, b) => rank(a.event) - rank(b.event)).map((a) => `<div class="stat"><span><i class="dot" style="background:${colorOf(a.event)}"></i>${esc(a.event)}<small>${esc(a.senderName?.replace("NWS ", "") || "")} · until ${esc(dayZ(a.ends || a.expires))}</small></span>${state.alerts.some((x) => x.id === a.id) ? `<button class="linkish" data-goalert="${esc(a.id)}">details</button>` : ""}</div>`).join("");
+    const storms = approachingStorms(p);
+    html += storms.length ? storms.map((st) => `<div class="stat eta"><span><i class="dot" style="background:${colorOf(st.a.event)}"></i>${st.minutes < 0 ? "Storm passed" : st.line ? "Line of storms arrives" : "Storm arrives"}<small>${esc(st.a.event)} · moving ${st.toward} at ${st.mph} mph${st.missKm >= 1.6 ? ` · passes ${mi(st.missKm)} mi to the ${st.side}` : " · on a direct path"} · position as of ${hhmmZ(st.mo.t)}</small></span><b>${st.minutes < 0 ? `${Math.round(-st.minutes)} min ago` : localTime(st.eta)}</b></div>${st.minutes >= 0 ? `<p class="note eta-note">In ${Math.round(st.minutes)} min, give or take ${Math.max(5, Math.round((st.minutes * 0.2) / 5) * 5)}, if it keeps its heading and speed.</p>` : ""}`).join("")
+      : stat("Storms heading here", "None", "No warned storm is on course to pass within 15 mi in the next 3 hours");
     html += lt ? stat("Lightning, 15 min", lt.near ? `${mi(lt.near.km)} mi` : "None", lt.near ? `Nearest flash, ${Math.round(lt.near.age)} min ago · ${lt.n10} within 10 mi · ${lt.n30} within 30 mi` : "No flashes within the GOES lightning window") : stat("Lightning", "—", "Lightning data unavailable");
     if (p.radar) html += stat("Radar now", p.radar.at > 0 ? `${Math.round(p.radar.at)} dBZ` : "No echo", `${p.radar.peak > 0 ? `Strongest within 6 mi: ${Math.round(p.radar.peak)} dBZ` : "Nothing within 6 mi"} · MRMS ${hhmmZ(p.radar.timeIso)}`);
     html += stat("Storm reports today", reports.length, reports[0] ? `Nearest: ${reportLabel(reports[0])}, ${mi(reports[0].km)} mi, ${esc(reports[0].time)}Z` : "None within 25 mi since 1200Z");
@@ -476,7 +689,7 @@
     html += `<label class="notify"><input type="checkbox" data-notify="1"${p.notify ? " checked" : ""}${canNotify ? "" : " disabled"} /> Notify me of new alerts and lightning within 10 mi while this page is open</label>
       <div class="actions"><button class="linkish" data-locate="1">Use my location</button><button class="linkish" data-forecast-here="1">Forecast here</button>
         <a class="linkish" href="/PastWeather/?loc=${p.lat.toFixed(4)},${p.lon.toFixed(4)}&amp;view=history">Hail history</a><button class="linkish" data-clear="1">Stop watching</button></div>
-      <p class="note">Rings at 10 and 30 miles. Checked every 2 minutes.</p></div>`;
+      <p class="note">Rings at 10 and 30 miles. Checked every 2 minutes. Storm arrival times come from the storm motion in each NWS warning.</p>${logHtml(p)}</div>`;
     return html;
   }
 
@@ -775,7 +988,17 @@
       return;
     }
     if (t.dataset.saved) { const sp = savedPlace(); if (sp) { setPlace(sp); map.flyTo([sp.lat, sp.lon], 8, { duration: 0.6 }); render(); } return; }
-    if (t.dataset.clear) { state.place = null; drawPlace(); render(); return; }
+    if (t.dataset.log) {
+      const act = t.dataset.log;
+      if (act === "start") startLog();
+      else if (act === "stop") stopLog();
+      else if (act === "csv") logCsv();
+      else if (act === "print") logPrint();
+      else if (act === "clear") { state.log = null; try { localStorage.removeItem(LOG_KEY); } catch { /* private mode */ } }
+      render();
+      return;
+    }
+    if (t.dataset.clear) { state.place = null; drawPlace(); drawStormTracks(); render(); return; }
     if (t.dataset.goalert) {
       const a = state.alerts.find((x) => x.id === t.dataset.goalert);
       if (a) { state.view = "alerts"; if (!GROUPS[state.group].test(a.event)) state.group = MARINE.test(a.event) ? "marine" : "land"; state.openEvent = a.event; setView("alerts"); selectAlert(a.id); }
@@ -837,9 +1060,10 @@
     if (state.on.lightning) layers.lightning.addTo(map);
     const results = await Promise.allSettled([loadAlerts(), loadOutlook(), loadMds(), loadReports(), loadLightning()]);
     setStatus(results[0].status === "rejected" ? "NWS alerts unavailable — try again shortly" : "");
+    drawStormTracks();
     render();
 
-    setInterval(() => loadAlerts().then(render).catch(() => {}), 2 * 60000);
+    setInterval(() => loadAlerts().then(() => { drawStormTracks(); render(); }).catch(() => {}), 2 * 60000);
     setInterval(() => refreshPlace(false), 2 * 60000);
     setInterval(() => { if (state.on.obs) loadObs().catch(() => {}); }, 10 * 60000);
     setInterval(() => { loadMds().catch(() => {}); loadReports().then(() => { if (state.view === "reports") render(); }).catch(() => {}); }, 5 * 60000);
@@ -858,6 +1082,15 @@
     state.view = "place";
     document.querySelectorAll("#views button").forEach((b) => b.setAttribute("aria-selected", b.dataset.view === "place"));
     map.setView([lat, lon], 8);
+  }
+
+  // A log that was recording when the page closed carries on for the same place.
+  if (state.log?.on) {
+    if (!state.place) setPlace({ label: state.log.label, lat: state.log.lat, lon: state.log.lon }, false);
+    if (Math.abs(state.log.lat - state.place.lat) < 1e-4 && Math.abs(state.log.lon - state.place.lon) < 1e-4) {
+      logTimer = setInterval(logSample, LOG_EVERY);
+      setTimeout(logSample, 20000);
+    }
   }
 
   init();

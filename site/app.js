@@ -289,7 +289,7 @@
       ? `<h4>Forecast · ${esc(fc.place)}</h4>${fc.periods.slice(0, 2).map((p) => `<p><b>${esc(p.name)}</b> ${p.temperature}°${esc(p.temperatureUnit)} · ${esc(p.shortForecast)} · wind ${esc(p.windSpeed)}</p>`).join("")}
         <p><a href="#" data-forecast="1">7-day and hourly forecast</a></p>`
       : `<p>No NWS forecast for this spot (outside the US forecast area).</p>`) +
-      `<p><a href="#" data-watch="${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}" data-label="${esc(fc?.place || "")}">Watch this spot</a> · <a href="/PastWeather/?loc=${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}&amp;view=history">Hail history</a></p>`;
+      `<p><a href="#" data-watch="${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}" data-label="${esc(fc?.place || "")}">Watch this spot</a> · <a href="/ForensicWeather/?loc=${e.latlng.lat.toFixed(4)},${e.latlng.lng.toFixed(4)}&amp;view=history">Hail history</a></p>`;
     popup.setContent([alertsHtml, fcHtml].filter(Boolean).join("<hr>"));
     if (state.view === "forecast") render();
   });
@@ -688,7 +688,7 @@
     const canNotify = typeof Notification !== "undefined";
     html += `<label class="notify"><input type="checkbox" data-notify="1"${p.notify ? " checked" : ""}${canNotify ? "" : " disabled"} /> Notify me of new alerts and lightning within 10 mi while this page is open</label>
       <div class="actions"><button class="linkish" data-locate="1">Use my location</button><button class="linkish" data-forecast-here="1">Forecast here</button>
-        <a class="linkish" href="/PastWeather/?loc=${p.lat.toFixed(4)},${p.lon.toFixed(4)}&amp;view=history">Hail history</a><button class="linkish" data-clear="1">Stop watching</button></div>
+        <a class="linkish" href="/ForensicWeather/?loc=${p.lat.toFixed(4)},${p.lon.toFixed(4)}&amp;view=history">Hail history</a><button class="linkish" data-clear="1">Stop watching</button></div>
       <p class="note">Rings at 10 and 30 miles. Checked every 2 minutes. Storm arrival times come from the storm motion in each NWS warning.</p>${logHtml(p)}</div>`;
     return html;
   }
@@ -1073,7 +1073,7 @@
     setInterval(() => { if (state.swath.hail !== "off" || state.swath.rot !== "off") redrawSwaths(); }, 5 * 60000);
   }
 
-  // ?loc=lat,lon (from PastWeather and the other pages) watches that spot.
+  // ?loc=lat,lon (from ForensicWeather and the other pages) watches that spot.
   const locParam = new URLSearchParams(location.search).get("loc")?.match(/^(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)$/);
   if (locParam) {
     const lat = +locParam[1], lon = +locParam[2];

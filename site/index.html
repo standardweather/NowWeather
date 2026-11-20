@@ -6,12 +6,12 @@
   <title>NowWeather | Standard Weather</title>
   <meta name="description" content="NowWeather — live NWS watches, warnings and advisories, SPC severe-weather outlooks, today's storm reports and radar." />
   <meta name="theme-color" content="#070914" />
-  <link rel="canonical" href="https://standardweather.github.io/NowWeather/" />
+  <link rel="canonical" href="https://standardweather.net/NowWeather/" />
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://standardweather.github.io/NowWeather/" />
+  <meta property="og:url" content="https://standardweather.net/NowWeather/" />
   <meta property="og:title" content="NowWeather | Standard Weather" />
   <meta property="og:description" content="Live NWS alerts, SPC outlooks, storm reports and radar." />
-  <meta property="og:image" content="https://standardweather.github.io/logo.png" />
+  <meta property="og:image" content="https://standardweather.net/logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -38,6 +38,16 @@
     .obs { text-align: center; line-height: 1; pointer-events: auto; }
     .obs b { font: 600 0.8rem var(--mono); text-shadow: 0 0 3px #060818, 0 0 3px #060818; }
     .obs small { display: block; font: 0.62rem var(--mono); color: #ffbf47; text-shadow: 0 0 3px #060818; }
+    /* On a phone the radar time bar spans the map's width, so lift the legend and credits above it. */
+    @media (max-width: 760px) {
+      .leaflet-bottom.leaflet-right { bottom: 4.3rem; }
+      .maplegend { max-width: min(16rem, calc(100vw - 2rem)); }
+    }
+    /* site.css widens the phone nav links by the page gutter on both sides, which in the console layout
+       pushes them past the right edge and makes the whole page scroll sideways. */
+    @media (max-width: 640px) {
+      .console .site-nav__links { width: auto; margin: 0; padding: 0; }
+    }
   </style>
 </head>
 <body class="console">
